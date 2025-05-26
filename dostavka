@@ -1,0 +1,584 @@
+import tkinter as tk
+import customtkinter as ctk
+import sqlite3
+import json
+import datetime
+import time
+from threading import Thread
+
+DB_NAME = "store.db"
+BACKUP_FILE = "orders_backup.json"
+
+# Настройка внешнего вида
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("green")
+
+
+def center_window(window, parent):
+    window.update_idletasks()
+    parent.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - window.winfo_width()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - window.winfo_height()) // 2
+    window.geometry(f"+{x}+{y}")
+
+
+def show_popup(parent, title, message, color):
+    popup = ctk.CTkToplevel(parent)
+    popup.title(title)
+    popup.geometry("300x150")
+    popup.resizable(False, False)
+    ctk.CTkLabel(popup, text=message, text_color=color, font=("Arial", 14)).pack(pady=20)
+    ctk.CTkButton(popup, text="Закрыть", command=popup.destroy).pack(pady=10)
+    center_window(popup, parent)
+    popup.grab_set()
+    popup.transient(parent)
+
+
+def show_error(parent, title, message):
+    show_popup(parent, title, message, "red")
+
+
+def show_success(parent, title, message):
+    show_popup(parent, title, message, "green")
+
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    try:
+        c.execute('''CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            price INTEGER NOT NULL
+        )''')
+        c.execute('''CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            datetime TEXT NOT NULL,
+            status TEXT NOT NULL,
+            total INTEGER NOT NULL,
+            items TEXT NOT NULL,
+            address TEXT NOT NULL
+        )''')
+
+        # Проверяем и добавляем столбец address, если его нет
+        c.execute("PRAGMA table_info(orders)")
+        columns = [column[1] for column in c.fetchall()]
+        if 'address' not in columns:
+            c.execute("ALTER TABLE orders ADD COLUMN address TEXT NOT NULL DEFAULT ''")
+
+        conn.commit()
+
+        # Создаем администратора по умолчанию
+        c.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
+        if c.fetchone()[0] == 0:
+            c.execute("INSERT INTO users (username, password, is_admin) VALUES ('admin', 'admin123', 1)")
+
+        # Добавляем тестовые товары
+        c.execute("SELECT COUNT(*) FROM products")
+        if c.fetchone()[0] == 0:
+            default_products = [
+                ("Хлеб белый", 50), ("Молоко 1л", 80), ("Яйца 10шт", 120),
+                ("Сок апельсиновый 1л", 150), ("Масло сливочное", 200),
+                ("Сыр российский", 300), ("Колбаса докторская", 250),
+                ("Чай черный", 100), ("Кофе молотый", 350), ("Сахар 1кг", 70),
+                ("Соль 1кг", 40), ("Макароны", 60), ("Рис 1кг", 90),
+                ("Гречка 1кг", 80), ("Печенье", 110)
+            ]
+            c.executemany("INSERT INTO products (name, price) VALUES (?, ?)", default_products)
+
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+    finally:
+        conn.close()
+
+
+class LoginApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("ПростоДоставка — Вход")
+        self.geometry("400x300")
+        self.resizable(False, False)
+
+        # Кнопка админ-панели
+        self.admin_btn = ctk.CTkButton(
+            self,
+            text="⚙",
+            width=30,
+            height=30,
+            command=self.open_admin_login
+        )
+        self.admin_btn.place(x=10, y=10)
+
+        # Основные элементы формы
+        self.username_var = tk.StringVar()
+        self.password_var = tk.StringVar()
+
+        ctk.CTkLabel(self, text="Логин").pack(pady=10)
+        ctk.CTkEntry(self, textvariable=self.username_var).pack(pady=5)
+        ctk.CTkLabel(self, text="Пароль").pack(pady=10)
+        ctk.CTkEntry(self, textvariable=self.password_var, show="*").pack(pady=5)
+
+        ctk.CTkButton(self, text="Войти", command=self.login).pack(pady=10)
+        ctk.CTkButton(self, text="Регистрация", command=self.register).pack(pady=5)
+
+    def open_admin_login(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Административный доступ")
+        win.geometry("300x200")
+        win.resizable(False, False)
+
+        username_var = tk.StringVar()
+        password_var = tk.StringVar()
+
+        ctk.CTkLabel(win, text="Логин администратора:").pack(pady=5)
+        ctk.CTkEntry(win, textvariable=username_var).pack(pady=5)
+        ctk.CTkLabel(win, text="Пароль:").pack(pady=5)
+        ctk.CTkEntry(win, textvariable=password_var, show="*").pack(pady=5)
+
+        def check_admin():
+            conn = sqlite3.connect(DB_NAME)
+            c = conn.cursor()
+            c.execute(
+                "SELECT password FROM users WHERE username=? AND is_admin=1",
+                (username_var.get(),)
+            )
+            result = c.fetchone()
+            conn.close()
+
+            if result and result[0] == password_var.get():
+                win.destroy()
+                self.destroy()
+                OnlineStoreApp(username="admin", is_admin=True).mainloop()
+            else:
+                show_error(win, "Ошибка", "Неверные учетные данные администратора")
+
+        ctk.CTkButton(win, text="Войти", command=check_admin).pack(pady=10)
+        center_window(win, self)
+
+    def login(self):
+        username = self.username_var.get()
+        password = self.password_var.get()
+
+        if not username or not password:
+            show_error(self, "Ошибка", "Заполните все поля")
+            return
+
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            "SELECT password, is_admin FROM users WHERE username = ?",
+            (username,)
+        )
+        result = c.fetchone()
+        conn.close()
+
+        if result and result[0] == password:
+            self.destroy()
+            OnlineStoreApp(username=username, is_admin=bool(result[1])).mainloop()
+        else:
+            show_error(self, "Ошибка", "Неверные учетные данные")
+
+    def register(self):
+        username = self.username_var.get()
+        password = self.password_var.get()
+
+        if not username or not password:
+            show_error(self, "Ошибка", "Заполните все поля")
+            return
+
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            c = conn.cursor()
+            c.execute(
+                "INSERT INTO users (username, password) VALUES (?, ?)",
+                (username, password)
+            )
+            conn.commit()
+            show_success(self, "Успех", "Регистрация прошла успешно")
+        except sqlite3.IntegrityError:
+            show_error(self, "Ошибка", "Пользователь уже существует")
+        except Exception as e:
+            show_error(self, "Ошибка", str(e))
+        finally:
+            conn.close()
+
+
+class OnlineStoreApp(ctk.CTk):
+    def __init__(self, username, is_admin):
+        super().__init__()
+        self.title("ПростоДоставка")
+        self.geometry("800x600")
+        self.username = username
+        self.is_admin = is_admin
+        self.cart = {}
+        self.order_status_window = None
+
+        # Верхняя панель
+        top_frame = ctk.CTkFrame(self)
+        top_frame.pack(fill="x", padx=10, pady=5)
+
+        # Статус заказа
+        self.status_label = ctk.CTkLabel(
+            top_frame,
+            text="Статус заказа: проверка...",
+            font=("Arial", 12)
+        )
+        self.status_label.pack(side="left", padx=10)
+
+        # Кнопки управления
+        self.cart_btn = ctk.CTkButton(
+            top_frame,
+            text="Корзина (0)",
+            command=self.view_cart
+        )
+        self.cart_btn.pack(side="left", padx=5)
+
+        if self.is_admin:
+            ctk.CTkButton(
+                top_frame,
+                text="Добавить товар",
+                command=self.add_product
+            ).pack(side="left", padx=5)
+
+            ctk.CTkButton(
+                top_frame,
+                text="Все заказы",
+                command=self.view_orders
+            ).pack(side="left", padx=5)
+
+        ctk.CTkButton(
+            top_frame,
+            text="Выйти",
+            command=self.logout
+        ).pack(side="right", padx=5)
+
+        # Каталог товаров
+        self.catalog_frame = ctk.CTkScrollableFrame(self)
+        self.catalog_frame.pack(expand=True, fill="both", padx=10, pady=10)
+        self.update_catalog()
+        self.update_order_status()
+
+    def update_order_status(self):
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            "SELECT status FROM orders WHERE username=? ORDER BY id DESC LIMIT 1",
+            (self.username,)
+        )
+        result = c.fetchone()
+        conn.close()
+
+        status = result[0] if result else "нет активных заказов"
+        self.status_label.configure(text=f"Статус заказа: {status}")
+
+    def logout(self):
+        self.destroy()
+        LoginApp().mainloop()
+
+    def update_catalog(self):
+        for widget in self.catalog_frame.winfo_children():
+            widget.destroy()
+
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT id, name, price FROM products ORDER BY name")
+
+        for product_id, name, price in c.fetchall():
+            frame = ctk.CTkFrame(self.catalog_frame)
+            frame.pack(fill="x", pady=5)
+
+            ctk.CTkLabel(
+                frame,
+                text=f"{name} — {price} руб.",
+                font=("Arial", 14)
+            ).pack(side="left", padx=10)
+
+            ctk.CTkButton(
+                frame,
+                text="В корзину",
+                command=lambda pid=product_id: self.add_to_cart(pid)
+            ).pack(side="right", padx=10)
+
+        conn.close()
+
+    def add_to_cart(self, product_id):
+        self.cart[product_id] = self.cart.get(product_id, 0) + 1
+        self.cart_btn.configure(text=f"Корзина ({sum(self.cart.values())})")
+
+    def view_cart(self):
+        if not self.cart:
+            show_popup(self, "Корзина", "Корзина пуста", "black")
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title("Корзина")
+        win.geometry("400x500")
+        win.resizable(False, False)
+
+        cart_frame = ctk.CTkScrollableFrame(win)
+        cart_frame.pack(expand=True, fill="both", padx=10, pady=10)
+
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        total = 0
+
+        for product_id, quantity in self.cart.items():
+            c.execute(
+                "SELECT name, price FROM products WHERE id = ?",
+                (product_id,)
+            )
+            name, price = c.fetchone()
+            total += price * quantity
+
+            frame = ctk.CTkFrame(cart_frame)
+            frame.pack(fill="x", pady=5)
+
+            ctk.CTkLabel(frame, text=f"{name}").pack(side="left", padx=10)
+            ctk.CTkLabel(frame, text=f"{quantity} x {price} руб.").pack(side="left")
+
+            ctk.CTkButton(
+                frame,
+                text="-",
+                width=30,
+                command=lambda pid=product_id: self.update_quantity(pid, -1)
+            ).pack(side="right", padx=2)
+
+            ctk.CTkButton(
+                frame,
+                text="+",
+                width=30,
+                command=lambda pid=product_id: self.update_quantity(pid, 1)
+            ).pack(side="right", padx=2)
+
+        ctk.CTkLabel(win, text=f"Итого: {total} руб.", font=("Arial", 16)).pack(pady=10)
+
+        # Поле для ввода адреса
+        address_var = tk.StringVar()
+        address_entry = ctk.CTkEntry(
+            win,
+            textvariable=address_var,
+            placeholder_text="Введите адрес доставки"
+        )
+        address_entry.pack(pady=10, padx=20, fill='x')
+
+        def on_checkout():
+            address = address_var.get().strip()
+            if not address:
+                show_error(win, "Ошибка", "Введите адрес доставки")
+                return
+            win.destroy()
+            self.process_payment(total, address)
+
+        ctk.CTkButton(
+            win,
+            text="Оформить заказ",
+            command=on_checkout
+        ).pack(pady=10)
+
+        conn.close()
+        center_window(win, self)
+
+    def update_quantity(self, product_id, delta):
+        new_qty = self.cart.get(product_id, 0) + delta
+        if new_qty > 0:
+            self.cart[product_id] = new_qty
+        else:
+            del self.cart[product_id]
+
+        self.cart_btn.configure(text=f"Корзина ({sum(self.cart.values())})")
+        self.view_cart()
+
+    def process_payment(self, total, address):
+        loading_win = ctk.CTkToplevel(self)
+        loading_win.title("Оплата")
+        loading_win.geometry("300x150")
+        ctk.CTkLabel(
+            loading_win,
+            text="Перенаправление в платежную систему...",
+            wraplength=250
+        ).pack(pady=20)
+
+        progress = ctk.CTkProgressBar(loading_win, mode="indeterminate")
+        progress.pack(pady=10, fill="x")
+        progress.start()
+        center_window(loading_win, self)
+
+        def complete_payment():
+            time.sleep(2)
+            loading_win.destroy()
+
+            try:
+                conn = sqlite3.connect(DB_NAME)
+                c = conn.cursor()
+                c.execute(
+                    "INSERT INTO orders (username, datetime, status, total, items, address) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        self.username,
+                        datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "принят",
+                        total,
+                        json.dumps(self.cart),
+                        address
+                    )
+                )
+                conn.commit()
+                conn.close()
+
+                # Резервное копирование
+                with open(BACKUP_FILE, "a") as f:
+                    json.dump({
+                        "user": self.username,
+                        "total": total,
+                        "items": self.cart,
+                        "datetime": datetime.datetime.now().isoformat(),
+                        "address": address
+                    }, f)
+                    f.write("\n")
+
+                self.cart.clear()
+                self.cart_btn.configure(text="Корзина (0)")
+                self.update_order_status()
+                show_success(self, "Успех", "Заказ успешно оформлен!")
+
+            except Exception as e:
+                show_error(self, "Ошибка", f"Ошибка оформления заказа: {str(e)}")
+
+        Thread(target=complete_payment).start()
+
+    def view_orders(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Управление заказами")
+        win.geometry("800x600")
+
+        tabs = ctk.CTkTabview(win)
+        tabs.pack(expand=True, fill="both")
+
+        # Вкладка заказов
+        orders_tab = tabs.add("Заказы")
+        scroll_frame = ctk.CTkScrollableFrame(orders_tab)
+        scroll_frame.pack(expand=True, fill="both")
+
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT * FROM orders ORDER BY id DESC")
+
+        for order in c.fetchall():
+            order_id, username, dt, status, total, items, address = order
+            frame = ctk.CTkFrame(scroll_frame)
+            frame.pack(fill="x", pady=5)
+
+            ctk.CTkLabel(
+                frame,
+                text=f"Заказ #{order_id} | {username} | {dt} | {status} | {total} руб. | Адрес: {address}"
+            ).pack(side="left", padx=10)
+
+            status_var = ctk.StringVar(value=status)
+            ctk.CTkOptionMenu(
+                frame,
+                values=["принят", "в сборке", "доставляется", "доставлен"],
+                variable=status_var,
+                command=lambda v, oid=order_id: self.update_order_status_db(oid, v)
+            ).pack(side="right", padx=10)
+
+        conn.close()
+
+        # Вкладка товаров
+        products_tab = tabs.add("Товары")
+        self.admin_products_frame = ctk.CTkScrollableFrame(products_tab)
+        self.admin_products_frame.pack(expand=True, fill="both")
+        self.load_admin_products()
+
+        center_window(win, self)
+
+    def update_order_status_db(self, order_id, new_status):
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute(
+            "UPDATE orders SET status = ? WHERE id = ?",
+            (new_status, order_id)
+        )
+        conn.commit()
+        conn.close()
+        self.update_order_status()
+
+    def load_admin_products(self):
+        for widget in self.admin_products_frame.winfo_children():
+            widget.destroy()
+
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("SELECT id, name, price FROM products ORDER BY name")
+
+        for product_id, name, price in c.fetchall():
+            frame = ctk.CTkFrame(self.admin_products_frame)
+            frame.pack(fill="x", pady=5)
+
+            ctk.CTkLabel(
+                frame,
+                text=f"{name} — {price} руб.",
+                font=("Arial", 14)
+            ).pack(side="left", padx=10)
+
+            ctk.CTkButton(
+                frame,
+                text="Удалить",
+                fg_color="red",
+                command=lambda pid=product_id: self.delete_product(pid)
+            ).pack(side="right", padx=10)
+
+        conn.close()
+
+    def delete_product(self, product_id):
+        conn = sqlite3.connect(DB_NAME)
+        c = conn.cursor()
+        c.execute("DELETE FROM products WHERE id = ?", (product_id,))
+        conn.commit()
+        conn.close()
+        self.load_admin_products()
+        self.update_catalog()
+
+    def add_product(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Добавить товар")
+        win.geometry("300x200")
+
+        name_var = tk.StringVar()
+        price_var = tk.StringVar()
+
+        ctk.CTkLabel(win, text="Название товара:").pack(pady=5)
+        ctk.CTkEntry(win, textvariable=name_var).pack(pady=5)
+
+        ctk.CTkLabel(win, text="Цена (руб):").pack(pady=5)
+        ctk.CTkEntry(win, textvariable=price_var).pack(pady=5)
+
+        def submit():
+            try:
+                conn = sqlite3.connect(DB_NAME)
+                c = conn.cursor()
+                c.execute(
+                    "INSERT INTO products (name, price) VALUES (?, ?)",
+                    (name_var.get(), int(price_var.get())))
+                conn.commit()
+                conn.close()
+                self.load_admin_products()
+                self.update_catalog()
+                win.destroy()
+                show_success(self, "Успех", "Товар добавлен")
+            except:
+                show_error(win, "Ошибка", "Некорректные данные")
+
+        ctk.CTkButton(win, text="Добавить", command=submit).pack(pady=15)
+        center_window(win, self)
+
+
+if __name__ == "__main__":
+    init_db()
+    LoginApp().mainloop()
